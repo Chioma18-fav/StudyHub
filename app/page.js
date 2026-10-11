@@ -5,7 +5,7 @@ import { sb } from '../lib/supabase';
 export default function Home() {
   const r = useRouter();
   const [mode, setMode] = useState('in');
-  const [f, setF] = useState({ name: '', email: '', password: '' });
+  const [f, setF] = useState({ name: '', university: '', email: '', password: '' });
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => { sb.auth.getSession().then(({ data }) => data.session && r.replace('/dashboard')); }, []);
@@ -13,7 +13,7 @@ export default function Home() {
   async function submit(e) {
     e.preventDefault(); setBusy(true); setMsg(null);
     if (mode === 'up') {
-      const { data, error } = await sb.auth.signUp({ email: f.email, password: f.password, options: { data: { name: f.name.trim() || 'Student' } } });
+      const { data, error } = await sb.auth.signUp({ email: f.email, password: f.password, options: { data: { name: f.name.trim() || 'Student', university: f.university.trim() } } });
       if (error) setMsg({ e: error.message });
       else if (data.session) r.push('/dashboard');
       else setMsg({ ok: 'Account created. Check your email to confirm, then sign in.' });
@@ -38,7 +38,7 @@ export default function Home() {
         </div>
         <form className="card" onSubmit={submit}>
           <h2>{mode === 'in' ? 'Welcome back' : 'Create your account'}</h2>
-          {mode === 'up' && (<><label htmlFor="n">Your name</label><input id="n" value={f.name} onChange={set('name')} required maxLength={40} /></>)}
+          {mode === 'up' && (<><label htmlFor="n">Your name</label><input id="n" value={f.name} onChange={set('name')} required maxLength={40} /><label htmlFor="u">University</label><input id="u" value={f.university} onChange={set('university')} maxLength={60} placeholder="e.g. University of Ibadan" /></>)}
           <label htmlFor="e">Email</label><input id="e" type="email" value={f.email} onChange={set('email')} required autoComplete="email" />
           <label htmlFor="p">Password</label><input id="p" type="password" value={f.password} onChange={set('password')} required minLength={8} autoComplete={mode === 'in' ? 'current-password' : 'new-password'} />
           <p className="mute" style={{ fontSize: 13, marginTop: 6 }}>{mode === 'up' && 'Use at least 8 characters.'}</p>
