@@ -1,34 +1,29 @@
-import { createClient } from '@supabase/supabase-js';
+import { auth, slide, gemini } from '../../../lib/server';
 const LEVELS = ['Primary school', 'Secondary school', 'University'];
+const ANIM = `You make short animated explainer diagrams as ONE SVG. Reply with ONLY the <svg>...</svg>, no markdown. Use viewBox="0 0 800 480". No scripts, no external images or fonts, font-family sans-serif, font size at least 16. Put a <style> inside the SVG. The diagram must draw itself step by step: give every shape, arrow and label the class "s" and an inline style animation-delay in seconds (0s, 1s, 2s...), with .s{opacity:0;animation:show .6s forwards} @keyframes show{to{opacity:1}}. Total animation 10 to 20 seconds. Start with a white background rect. At most 25 elements, clear labels, accurate. Use correct notation for the diagram type: ER (rectangles, diamonds, ovals), UML (boxes with compartments, standard arrows), biology (labelled schematic parts with arrows showing the process). When slides are attached, follow them.`;
 export async function POST(req) {
-  const token = (req.headers.get('authorization') || '').replace('Bearer ', '');
-  const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, { global: { headers: { Authorization: `Bearer ${token}` } } });
-  const { data: { user } } = await sb.auth.getUser(token);
+  const { sb, user } = await auth(req);
   if (!user) return Response.json({ error: 'Please sign in again.' }, { status: 401 });
-  const { workspaceId, docId, message, level, course: c } = await req.json();
+  const { workspaceId, docId, message, level, course: c, anim } = await req.json();
   const course = String(c || 'General').slice(0, 40);
   if (!message || message.length > 2000) return Response.json({ error: 'Message is empty or too long.' }, { status: 400 });
-  const { data: hist } = await sb.from('ai_chats').select('role,content').eq('workspace_id', workspaceId).eq('user_id', user.id).eq('course', course).order('id', { ascending: false }).limit(10);
-  const contents = (hist || []).reverse().map(h => ({ role: h.role, parts: [{ text: h.content }] }));
-  const parts = [{ text: message }];
-  if (docId) {
-    const { data: d } = await sb.from('docs').select('path').eq('id', docId).eq('workspace_id', workspaceId).single();
-    if (d) {
-      const { data: f } = await sb.storage.from('slides').download(d.path);
-      if (f) parts.unshift({ inlineData: { mimeType: 'application/pdf', data: Buffer.from(await f.arrayBuffer()).toString('base64') } });
-    }
+  let contents = [];
+  if (!anim) {
+    const { data: hist } = await sb.from('ai_chats').select('role,content').eq('workspace_id', workspaceId).eq('user_id', user.id).eq('course', course).order('id', { ascending: false }).limit(10);
+    contents = (hist || []).reverse().map(h => ({ role: h.role, parts: [{ text: h.content }] }));
   }
+  const parts = [{ text: message }];
+  const sp = await slide(sb, workspaceId, docId); if (sp) parts.unshift(sp);
   contents.push({ role: 'user', parts });
   const lvl = LEVELS.includes(level) ? level : 'University';
-  const sys = `You are a patient study tutor for a ${lvl} student. Follow any style the student asks for (for example simpler words, examples, or step by step). When slides are attached, base answers on them and say if something is not in them. Be accurate and say when you are unsure.`;
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents }),
-  });
-  const j = await r.json();
-  const text = j.candidates?.[0]?.content?.parts?.map(p => p.text).join('');
-  if (!text) return Response.json({ error: 'AI error (' + r.status + '): ' + (j.error?.message || j.promptFeedback?.blockReason || 'no answer returned') }, { status: 502 });
-  await sb.from('ai_chats').insert([{ workspace_id: workspaceId, user_id: user.id, role: 'user', content: message, course }, { workspace_id: workspaceId, user_id: user.id, role: 'model', content: text, course }]);
-  return Response.json({ text });
+  const sys = anim ? ANIM : `You are a patient study tutor for a ${lvl} student. Follow any style the student asks for (for example simpler words, examples, or step by step). When slides are attached, base answers on them and say if something is not in them. Be accurate and say when you are unsure.`;
+  const r = await gemini(sys, contents);
+  if (r.error) return Response.json({ error: r.error }, { status: 502 });
+  if (anim) {
+    const t = r.text, i = t.indexOf('<svg'), j = t.lastIndexOf('</svg>');
+    if (i < 0 || j < 0) return Response.json({ error: 'The AI did not return a drawing. Try again with a simpler request.' }, { status: 502 });
+    return Response.json({ svg: t.slice(i, j + 6).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*')/gi, '') });
+  }
+  await sb.from('ai_chats').insert([{ workspace_id: workspaceId, user_id: user.id, role: 'user', content: message, course }, { workspace_id: workspaceId, user_id: user.id, role: 'model', content: r.text, course }]);
+  return Response.json({ text: r.text });
 }
