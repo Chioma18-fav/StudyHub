@@ -11,52 +11,39 @@ export default function Dashboard() {
   const [n, setN] = useState('');
   const [c, setC] = useState('');
   const [err, setErr] = useState('');
-  const [online, setOnline] = useState([]);
-  async function load() {
-    const { data } = await sb.from('members').select('workspaces(id,name,code)').eq('user_id', user.id);
-    setWs((data || []).map(x => x.workspaces).filter(Boolean));
-  }
+  const [online, setOnline] = useState(0);
   useEffect(() => {
     if (!ready) return;
-    load();
-    const ch = sb.channel('lobby', { config: { presence: { key: user.id } } });
-    ch.on('presence', { event: 'sync' }, () => setOnline(Object.values(ch.presenceState()).map(a => a[0].name)));
-    ch.subscribe(s => { if (s === 'SUBSCRIBED') ch.track({ name }); });
-    return () => { sb.removeChannel(ch); };
+    sb.from('members').select('workspaces(id,name,code)').eq('user_id', user.id).then(({ data }) => setWs((data || []).map(x => x.workspaces).filter(Boolean)));
+    const on = e => setOnline(e.detail.length);
+    window.addEventListener('sh:online', on); setOnline((window.__online || []).length);
+    return () => window.removeEventListener('sh:online', on);
   }, [ready]);
-  async function create(e) {
+  async function act(e, fn, args) {
     e.preventDefault(); setErr('');
-    const { data, error } = await sb.rpc('create_workspace', { n });
-    if (error) return setErr(error.message); r.push('/w/' + data);
-  }
-  async function join(e) {
-    e.preventDefault(); setErr('');
-    const { data, error } = await sb.rpc('join_workspace', { c });
+    const { data, error } = await sb.rpc(fn, args);
     if (error) return setErr(error.message); r.push('/w/' + data);
   }
   if (!ready) return <div className="wrap empty">Loading…</div>;
   return (
-    <main className="wrap">
-      <div className="top"><span className="logo">Study<b>Hub</b></span>
-        <span className="row"><span className="mute">{name}</span><button className="btn ghost" onClick={() => sb.auth.signOut()}>Sign out</button></span></div>
-      <h2>Your workspaces</h2>
-      {ws.length === 0 ? <div className="card empty">You are not in a workspace yet. Create one below, or join with a code from a friend.</div> :
-        <div className="grid3">{ws.map(w => (
-          <Link key={w.id} href={'/w/' + w.id} className="card" style={{ textDecoration: 'none', color: 'inherit' }}>
-            <h3>{w.name}</h3><p className="mute" style={{ margin: 0 }}>Invite code: {w.code}</p>
-          </Link>))}</div>}
-      <div className="grid2" style={{ marginTop: 22, gridTemplateColumns: '1fr 1fr' }}>
-        <form className="card" onSubmit={create}><h3>Start a workspace</h3>
-          <label htmlFor="wn">Name (a course, a group, an exam)</label><input id="wn" value={n} onChange={e => setN(e.target.value)} required maxLength={60} />
-          <p /><button className="btn">Create workspace</button></form>
-        <form className="card" onSubmit={join}><h3>Join with a code</h3>
-          <label htmlFor="wc">Invite code</label><input id="wc" value={c} onChange={e => setC(e.target.value)} required maxLength={12} />
-          <p /><button className="btn">Join workspace</button></form>
-      </div>
-      {err && <div className="err">{err}</div>}
-      <div className="card" style={{ marginTop: 22 }}><h3>Studying right now</h3>
-        <div className="pills">{[...new Set(online)].map((o, i) => <span key={i} className="chip"><span className="dot" />{o}</span>)}</div>
-        <p className="mute" style={{ margin: 0, fontSize: 14 }}>You can see who is online, but you can only enter a workspace with its invite code.</p></div>
-    </main>
+    <>
+      <div className="hdr"><div className="hdr-in">
+        <div className="row between"><span className="logo">Study<b>Hub</b></span><button className="chip" onClick={() => sb.auth.signOut()}>Sign out</button></div>
+        <h1 className="wtitle">Welcome, {name.split(' ')[0]}!</h1>
+        <Link href="/lounge" className="chip"><span className="dot" />{online} online · Open lounge</Link>
+      </div></div>
+      <main className="sheet">
+        <div className="card"><h2>My workspaces</h2>
+          {ws.length === 0 ? <p className="mute">No workspace yet. Start one below or join with a code.</p> :
+            <div className="tiles">{ws.map((w, i) => <Link key={w.id} href={'/w/' + w.id} className={'tile t' + (i % 3)}><span>{w.name}<br /><small>Code {w.code}</small></span><span>›</span></Link>)}</div>}
+        </div>
+        <div className="card"><h3>Start a new workspace</h3>
+          <form className="row" onSubmit={e => act(e, 'create_workspace', { n })}><input aria-label="Workspace name" placeholder="e.g. 300L CS Squad" value={n} onChange={e => setN(e.target.value)} required maxLength={60} /><button className="btn">Create</button></form>
+          <p className="mute" style={{ fontSize: 13, margin: '8px 0 0' }}>You can create as many as you want.</p></div>
+        <div className="card"><h3>Join with a code</h3>
+          <form className="row" onSubmit={e => act(e, 'join_workspace', { c })}><input aria-label="Invite code" placeholder="Invite code" value={c} onChange={e => setC(e.target.value)} required maxLength={12} /><button className="btn">Join</button></form></div>
+        {err && <div className="err">{err}</div>}
+      </main>
+    </>
   );
 }
