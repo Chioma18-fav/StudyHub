@@ -1,4 +1,5 @@
 import { auth, slide, gemini } from '../../../lib/server';
+export const maxDuration = 60;
 export async function POST(req) {
   const { sb, user } = await auth(req);
   if (!user) return Response.json({ error: 'Please sign in again.' }, { status: 401 });
