@@ -9,123 +9,209 @@ const fmt = s => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 6
 
 export default function Workspace() {
   const { id } = useParams();
-  const { session, user, name, ready } = useUser();
-  const [w, setW] = useState(null);
-  const [people, setPeople] = useState([]);
-  const [docs, setDocs] = useState([]);
-  const [tab, setTab] = useState('study');
-  const [locked, setLocked] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const loadDocs = async () => { const { data } = await sb.from('docs').select('id,title,course').eq('workspace_id', id).order('created_at', { ascending: false }); setDocs(data || []); };
-  useEffect(() => {
-    if (!ready) return;
-    sb.from('workspaces').select('name,code').eq('id', id).single().then(({ data }) => setW(data || false));
-    sb.from('members').select('profiles(name)').eq('workspace_id', id).then(({ data }) => setPeople((data || []).map(x => x.profiles?.name).filter(Boolean)));
-    loadDocs();
-  }, [ready, id]);
-  if (!ready || w === null) return <div className="wrap empty">Loading…</div>;
-  if (w === false) return <div className="wrap empty">This workspace does not exist, or you are not a member. <Link href="/dashboard">Back to your workspaces</Link></div>;
-  return (
-    <main className="wrap">
-      <div className="top"><Link href="/dashboard" className="logo" onClick={e => locked && e.preventDefault()}>Study<b>Hub</b></Link>
-        <span className="row"><button className="chip" onClick={() => { navigator.clipboard.writeText(w.code); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? 'Copied' : 'Invite code: ' + w.code}</button></span></div>
-      <h2>{w.name}</h2>
-      <p className="mute">{people.join(', ')}</p>
-      <div className="tabs" role="tablist">
-        {[['study', 'Study'], ['chat', 'Group chat'], ['library', 'Slides']].map(([k, l]) =>
-          <button key={k} role="tab" className={'tab' + (tab === k ? ' on' : '')} disabled={locked && tab !== k} onClick={() => setTab(k)}>{l}</button>)}
-      </div>
-      {tab === 'study' && <Study id={id} session={session} user={user} docs={docs} onLock={setLocked} />}
-      {tab === 'chat' && <Chat id={id} user={user} name={name} />}
-      {tab === 'library' && <Library id={id} user={user} docs={docs} reload={loadDocs} />}
-    </main>
-  );
+  const u = useUser();
+  if (!u.ready) return <div className="wrap empty">Loading…</div>;
+  return <Room id={id} session={u.session} user={u.user} name={u.name} />;
 }
 
-function Study({ id, session, user, docs, onLock }) {
-  const [msgs, setMsgs] = useState([]);
-  const [input, setInput] = useState('');
-  const [docId, setDocId] = useState('');
-  const [level, setLevel] = useState('University');
-  const [simple, setSimple] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-  const [phase, setPhase] = useState('setup');
-  const [mins, setMins] = useState(60);
-  const [total, setTotal] = useState(0);
+function useFocus(id, user) {
+  const [sess, setSess] = useState(null);
+  const [phase, setPhase] = useState('wait');
   const [left, setLeft] = useState(0);
-  const [paused, setPaused] = useState(false);
   const [strikes, setStrikes] = useState(0);
+  const [paused, setPaused] = useState(false);
   const last = useRef(Date.now());
-  const phaseRef = useRef('setup');
-  const end = useRef(null);
-  useEffect(() => { sb.from('ai_chats').select('role,content').eq('workspace_id', id).eq('user_id', user.id).order('id').limit(100).then(({ data }) => setMsgs(data || [])); }, [id]);
-  useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [msgs]);
+  const phaseRef = useRef('wait'), leftRef = useRef(0), strikesRef = useRef(0), sessRef = useRef(null);
+  const go = p => { phaseRef.current = p; setPhase(p); };
+  const save = () => { if (sessRef.current) sb.from('progress').upsert({ workspace_id: id, user_id: user.id, session_id: sessRef.current.id, left_s: leftRef.current, strikes: strikesRef.current }); };
+  useEffect(() => {
+    const get = () => sb.from('sessions').select('*').eq('workspace_id', id).maybeSingle().then(({ data }) => setSess(data));
+    get();
+    const ch = sb.channel('sess-' + id).on('postgres_changes', { event: '*', schema: 'public', table: 'sessions', filter: 'workspace_id=eq.' + id }, get).subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [id]);
+  useEffect(() => {
+    sessRef.current = sess;
+    if (!sess) { go('wait'); return; }
+    sb.from('progress').select('*').eq('workspace_id', id).eq('user_id', user.id).maybeSingle().then(({ data }) => {
+      const same = data && data.session_id === sess.id;
+      leftRef.current = same ? data.left_s : sess.minutes * 60; strikesRef.current = same ? data.strikes : 0;
+      setLeft(leftRef.current); setStrikes(strikesRef.current);
+      go(leftRef.current <= 0 ? 'done' : 'ready');
+    });
+  }, [sess?.id]);
   useEffect(() => {
     const act = () => { last.current = Date.now(); };
-    const vis = () => { if (document.hidden && phaseRef.current === 'run') setStrikes(s => s + 1); };
+    const vis = () => { if (document.hidden && phaseRef.current === 'run') { strikesRef.current += 1; setStrikes(strikesRef.current); save(); } };
     const warn = e => { if (phaseRef.current === 'run') { e.preventDefault(); e.returnValue = ''; } };
-    ['mousemove', 'keydown', 'touchstart', 'scroll', 'click'].forEach(t => window.addEventListener(t, act, true));
+    const evs = ['mousemove', 'keydown', 'touchstart', 'scroll', 'click'];
+    evs.forEach(t => window.addEventListener(t, act, true));
     document.addEventListener('visibilitychange', vis); window.addEventListener('beforeunload', warn);
-    return () => { ['mousemove', 'keydown', 'touchstart', 'scroll', 'click'].forEach(t => window.removeEventListener(t, act, true)); document.removeEventListener('visibilitychange', vis); window.removeEventListener('beforeunload', warn); };
+    return () => { evs.forEach(t => window.removeEventListener(t, act, true)); document.removeEventListener('visibilitychange', vis); window.removeEventListener('beforeunload', warn); };
   }, []);
   useEffect(() => {
     if (phase !== 'run') return;
+    let n = 0;
     const iv = setInterval(() => {
-      const active = !document.hidden && document.hasFocus() && Date.now() - last.current < 90000;
-      setPaused(!active);
-      if (active) setLeft(l => { if (l <= 1) { phaseRef.current = 'done'; setPhase('done'); onLock(false); return 0; } return l - 1; });
+      const active = !document.hidden && document.hasFocus() && Date.now() - last.current < 60000;
+      setPaused(!active); if (!active) return;
+      leftRef.current -= 1; setLeft(leftRef.current);
+      if (leftRef.current <= 0) { leftRef.current = 0; save(); go('done'); return; }
+      if (++n % 5 === 0) save();
     }, 1000);
     return () => clearInterval(iv);
   }, [phase]);
-  function start() { const s = Math.max(1, Math.min(600, +mins || 60)) * 60; setTotal(s); setLeft(s); setStrikes(0); last.current = Date.now(); phaseRef.current = 'run'; setPhase('run'); onLock(true); }
+  return { sess, phase, left, strikes, paused, start: () => { last.current = Date.now(); go('run'); } };
+}
+
+function Room({ id, session, user, name }) {
+  const f = useFocus(id, user);
+  const [w, setW] = useState(null);
+  const [people, setPeople] = useState([]);
+  const [docs, setDocs] = useState([]);
+  const [courses, setCourses] = useState([]);
+  const [tab, setTab] = useState('study');
+  const [course, setCourse] = useState(null);
+  const [doc, setDoc] = useState(null);
+  const [mins, setMins] = useState(60);
+  const [nc, setNc] = useState('');
+  const [err, setErr] = useState('');
+  const [copied, setCopied] = useState(false);
+  const loadPeople = async () => { const { data } = await sb.from('members').select('user_id,profiles(name)').eq('workspace_id', id); setPeople((data || []).map(x => ({ id: x.user_id, name: x.profiles?.name || 'Student' }))); };
+  const reload = async () => {
+    const a = await sb.from('docs').select('id,title,course,path').eq('workspace_id', id).order('created_at', { ascending: false }); setDocs(a.data || []);
+    const b = await sb.from('courses').select('name').eq('workspace_id', id); setCourses((b.data || []).map(x => x.name));
+  };
+  useEffect(() => { sb.from('workspaces').select('name,code,owner').eq('id', id).single().then(({ data }) => setW(data || false)); loadPeople(); reload(); }, [id]);
+  useEffect(() => { if (w) window.dispatchEvent(new CustomEvent('sh:ctx', { detail: { ws: id, wsName: w.name, owner: w.owner, course: doc ? doc.course : null } })); }, [w, doc]);
+  useEffect(() => () => window.dispatchEvent(new CustomEvent('sh:ctx', { detail: {} })), []);
+  if (w === null) return <div className="wrap empty">Loading…</div>;
+  if (w === false) return <div className="wrap empty">This workspace does not exist, or you are not a member. <Link href="/dashboard">Back</Link></div>;
+  const isOwner = w.owner === user.id;
+  const names = [...new Set([...courses, ...docs.map(d => d.course)])];
+  const running = f.phase === 'run';
+  async function remove(p) { if (!confirm('Remove ' + p.name + ' from this workspace?')) return; await sb.from('members').delete().eq('workspace_id', id).eq('user_id', p.id); loadPeople(); }
+  async function begin() { setErr(''); const { error } = await sb.rpc('start_session', { w: id, m: Math.max(1, Math.min(600, +mins || 60)) }); if (error) setErr(error.message); }
+  async function addCourse(e) { e.preventDefault(); const n = nc.trim(); if (!n) return; await sb.from('courses').insert({ workspace_id: id, name: n.slice(0, 40) }); setNc(''); reload(); }
+  const open = d => { setCourse(d.course); setDoc(d); setTab('study'); };
+  const total = f.sess ? f.sess.minutes * 60 : 1;
+  return (
+    <>
+      <div className="hdr"><div className="hdr-in">
+        <div className="row between"><Link href="/dashboard" className="back" aria-label="Back">‹</Link>
+          <div className="timer">{running ? <><b>{fmt(f.left)}</b><span>{f.paused ? 'paused' : 'running'}</span></> : <span>{f.phase === 'done' ? 'Reading done' : 'No session running'}</span>}</div></div>
+        <h1 className="wtitle">{w.name}</h1>
+        <div className="pills">
+          <button className="chip" onClick={() => { navigator.clipboard.writeText(w.code); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? 'Copied' : 'Code ' + w.code}</button>
+          {people.map(p => <span key={p.id} className="chip">{p.name}{p.id === w.owner ? ' (creator)' : ''}{isOwner && p.id !== user.id && <button aria-label={'Remove ' + p.name} onClick={() => remove(p)} style={{ background: 'none', border: 0, color: '#fff', cursor: 'pointer', marginLeft: 6 }}>✕</button>}</span>)}
+        </div>
+      </div></div>
+      <main className="sheet">
+        <div className="tabs" role="tablist">
+          {[['study', 'Study'], ['chat', 'Chat'], ['slides', 'Slides'], ['history', 'AI history']].map(([k, l]) => <button key={k} role="tab" className={'tab' + (tab === k ? ' on' : '')} onClick={() => setTab(k)}>{l}</button>)}
+        </div>
+
+        <section hidden={tab !== 'study'}>
+          <div className="card"><h3>Study session</h3>
+            {f.phase === 'wait' && <p className="mute">{isOwner ? 'Set the reading time for everyone in this workspace.' : 'Waiting for the workspace creator to set the reading time.'}</p>}
+            {f.phase === 'ready' && <><p className="mute">Reading time: {f.sess.minutes} min.{f.left < total ? ' You have ' + fmt(f.left) + ' left.' : ''}</p><button className="btn" style={{ width: '100%' }} onClick={f.start}>{f.left < total ? 'Resume reading' : 'Start reading'}</button></>}
+            {running && <><div className="clock"><span>{fmt(f.left)}</span></div><div className="bar"><i style={{ width: ((total - f.left) / total * 100) + '%' }} /></div>
+              {f.paused && <div className="pause" role="alert">Paused. Come back to this page and keep reading to continue.</div>}
+              <p className="mute" style={{ margin: 0 }}>Times you left the page: {f.strikes}. Chat is locked until the timer ends.</p></>}
+            {f.phase === 'done' && <div className="ok" style={{ marginTop: 0 }}>Reading time complete. Chat is now unlocked. You left the page {f.strikes} {f.strikes === 1 ? 'time' : 'times'}.</div>}
+            {isOwner && !running && <div style={{ marginTop: 14 }}><label htmlFor="m">{f.sess ? 'Start a new session for everyone (minutes)' : 'Reading time for everyone (minutes)'}</label>
+              <div className="row"><input id="m" type="number" min="1" max="600" value={mins} onChange={e => setMins(e.target.value)} /><button className="btn" onClick={begin}>Set</button></div></div>}
+            {err && <div className="err">{err}</div>}
+          </div>
+          {!course && <div className="card"><h3>Course modules</h3>
+            {names.length === 0 && <p className="mute">No modules yet. Add one, for example CSC 201.</p>}
+            <div className="tiles">{names.map((c, i) => <button key={c} className={'tile t' + (i % 3)} onClick={() => setCourse(c)}><span>{c}<br /><small>{docs.filter(d => d.course === c).length} slides</small></span><span>›</span></button>)}</div>
+            <form className="row" onSubmit={addCourse}><input aria-label="New module" placeholder="New module name" value={nc} onChange={e => setNc(e.target.value)} maxLength={40} /><button className="btn">Add</button></form></div>}
+          {course && !doc && <div className="card"><button className="chip" onClick={() => setCourse(null)}>‹ All modules</button><h3 style={{ marginTop: 12 }}>{course}</h3>
+            {docs.filter(d => d.course === course).length === 0 && <p className="mute">No slides here yet. Add some in the Slides tab.</p>}
+            <div className="tiles">{docs.filter(d => d.course === course).map((d, i) => <button key={d.id} className={'tile t' + (i % 3)} onClick={() => setDoc(d)}><span>{d.title}</span><span>›</span></button>)}</div></div>}
+          {doc && <><div className="card"><div className="row between"><button className="chip" onClick={() => setDoc(null)}>‹ {doc.course}</button><span className="mute">{doc.title}</span></div><PdfView path={doc.path} /></div>
+            <Tutor id={id} session={session} user={user} course={doc.course} docId={doc.id} /></>}
+        </section>
+
+        <section hidden={tab !== 'chat'}><Chat id={id} user={user} name={name} locked={running} left={f.left} /></section>
+        <section hidden={tab !== 'slides'}><Library id={id} user={user} names={names} docs={docs} reload={reload} onOpen={open} /></section>
+        <section hidden={tab !== 'history'}><History id={id} session={session} user={user} active={tab === 'history'} /></section>
+      </main>
+    </>
+  );
+}
+
+function PdfView({ path }) {
+  const box = useRef(null);
+  const [st, setSt] = useState('Loading slides…');
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      const { data } = await sb.storage.from('slides').createSignedUrl(path, 3600); if (!data) throw 0;
+      if (!window.pdfjsLib) await new Promise((ok, no) => { const s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'; s.onload = ok; s.onerror = no; document.head.appendChild(s); });
+      const L = window.pdfjsLib; L.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      const pdf = await L.getDocument(data.signedUrl).promise; box.current.innerHTML = '';
+      for (let i = 1; i <= pdf.numPages && !dead; i++) {
+        const pg = await pdf.getPage(i); const v = pg.getViewport({ scale: 1.5 });
+        const c = document.createElement('canvas'); c.width = v.width; c.height = v.height; c.className = 'pg'; box.current.appendChild(c);
+        await pg.render({ canvasContext: c.getContext('2d'), viewport: v }).promise;
+      }
+      setSt('');
+    })().catch(() => setSt('Could not display this PDF.'));
+    return () => { dead = true; };
+  }, [path]);
+  return <div className="pdf">{st && <div className="empty">{st}</div>}<div ref={box} /></div>;
+}
+
+function Tutor({ id, session, user, course, docId }) {
+  const [msgs, setMsgs] = useState([]);
+  const [input, setInput] = useState('');
+  const [level, setLevel] = useState('University');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const end = useRef(null);
+  useEffect(() => { sb.from('ai_chats').select('role,content').eq('workspace_id', id).eq('user_id', user.id).eq('course', course).order('id').limit(100).then(({ data }) => setMsgs(data || [])); }, [id, course]);
+  useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [msgs]);
   async function send(e) {
     e.preventDefault(); const text = input.trim(); if (!text || busy) return;
     setInput(''); setErr(''); setBusy(true); setMsgs(m => [...m, { role: 'user', content: text }]);
     try {
-      const r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id, docId: docId || null, message: text, level, simple }) });
+      const r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id, docId: docId || null, message: text, level, course }) });
       const j = await r.json();
       if (j.error) setErr(j.error); else setMsgs(m => [...m, { role: 'model', content: j.text }]);
     } catch { setErr('No connection. Check your data and try again.'); }
     setBusy(false);
   }
   return (
-    <div className="grid2">
-      <div className="card chat">
-        <div className="row" style={{ marginBottom: 10 }}>
-          <select aria-label="Slides to study" value={docId} onChange={e => setDocId(e.target.value)}><option value="">No slides selected</option>{docs.map(d => <option key={d.id} value={d.id}>{d.course}: {d.title}</option>)}</select>
-          <select aria-label="Level" value={level} onChange={e => setLevel(e.target.value)} style={{ maxWidth: 160 }}><option>Primary school</option><option>Secondary school</option><option>University</option></select>
-        </div>
-        <label className="row" style={{ margin: '0 0 8px', fontWeight: 500 }}><input type="checkbox" checked={simple} onChange={e => setSimple(e.target.checked)} style={{ width: 'auto' }} />Explain like I am 15</label>
-        <div className="msgs">
-          {msgs.length === 0 && <div className="empty">Pick your slides, then ask about anything you did not understand.</div>}
-          {msgs.map((m, i) => <div key={i} className={'b ' + (m.role === 'user' ? 'me' : 'them')}>{m.content}</div>)}
-          {busy && <div className="b them">Thinking…</div>}<div ref={end} />
-        </div>
-        {err && <div className="err" style={{ margin: '0 0 8px' }}>{err}</div>}
-        <form className="row" onSubmit={send}><input aria-label="Ask the AI" value={input} onChange={e => setInput(e.target.value)} placeholder="Ask about your slides" maxLength={2000} /><button className="btn" disabled={busy}>Ask</button></form>
+    <div className="card chat">
+      <div className="row" style={{ marginBottom: 10 }}><h3 style={{ margin: 0, flex: 1 }}>Ask AI tutor · {course}</h3>
+        <select aria-label="Level" value={level} onChange={e => setLevel(e.target.value)} style={{ maxWidth: 150 }}><option>Primary school</option><option>Secondary school</option><option>University</option></select></div>
+      <div className="msgs">
+        {msgs.length === 0 && <div className="empty">Ask anything about your slides. You can tell the AI how to explain, for example "use a Nigerian example".</div>}
+        {msgs.map((m, i) => <div key={i} className={'b ' + (m.role === 'user' ? 'me' : 'them')}>{m.content}</div>)}
+        {busy && <div className="b them">Thinking…</div>}<div ref={end} />
       </div>
-      <div className="card" style={{ alignSelf: 'start' }}>
-        <h3>Study session</h3>
-        {phase === 'setup' && (<>
-          <label htmlFor="m">How many minutes will you read?</label>
-          <div className="pills">{[30, 60, 120].map(x => <button key={x} type="button" className="chip" onClick={() => setMins(x)}>{x} min</button>)}</div>
-          <input id="m" type="number" min="1" max="600" value={mins} onChange={e => setMins(e.target.value)} />
-          <p className="mute" style={{ fontSize: 14, marginTop: 10 }}>Once you start, the timer only counts while you stay on this page and keep reading. You cannot switch tabs without it pausing.</p>
-          <button className="btn" style={{ width: '100%' }} onClick={start}>Start session</button></>)}
-        {phase === 'run' && (<>
-          <div className="clock"><span>{fmt(left)}</span></div>
-          <div className="bar"><i style={{ width: ((total - left) / total * 100) + '%' }} /></div>
-          {paused && <div className="pause" role="alert">Paused. Come back to this page and keep reading to continue.</div>}
-          <p className="mute" style={{ margin: 0 }}>Times you left the page: {strikes}</p></>)}
-        {phase === 'done' && (<><div className="ok" style={{ marginTop: 0 }}>Session complete. You stayed focused for {Math.round(total / 60)} minutes with {strikes} tab {strikes === 1 ? 'switch' : 'switches'}.</div>
-          <p><button className="btn ghost" style={{ marginTop: 12 }} onClick={() => { phaseRef.current = 'setup'; setPhase('setup'); }}>Start another</button></p></>)}
-      </div>
+      {err && <div className="err" style={{ margin: '0 0 8px' }}>{err}</div>}
+      <form className="row" onSubmit={send}><input aria-label="Ask the AI" value={input} onChange={e => setInput(e.target.value)} placeholder="Ask AI tutor" maxLength={2000} /><button className="btn" disabled={busy}>Ask</button></form>
     </div>
   );
 }
 
-function Chat({ id, user, name }) {
+function History({ id, session, user, active }) {
+  const [items, setItems] = useState([]);
+  const [open, setOpen] = useState(null);
+  useEffect(() => {
+    if (!active || open) return;
+    sb.from('ai_chats').select('course,content').eq('workspace_id', id).eq('user_id', user.id).order('id', { ascending: false }).limit(200).then(({ data }) => { const m = {}; (data || []).forEach(x => { if (!m[x.course]) m[x.course] = x; }); setItems(Object.values(m)); });
+  }, [id, active, open]);
+  if (open) return <div><button className="chip" style={{ marginBottom: 10 }} onClick={() => setOpen(null)}>‹ All chats</button><Tutor id={id} session={session} user={user} course={open} docId="" /></div>;
+  return <div className="card"><h3>AI chat history</h3>
+    {items.length === 0 && <p className="mute">No AI chats yet. Open a slide and ask the tutor something.</p>}
+    <div className="tiles">{items.map((x, i) => <button key={x.course} className={'tile t' + (i % 3)} onClick={() => setOpen(x.course)}><span>{x.course}<br /><small>{x.content.slice(0, 60)}</small></span><span>›</span></button>)}</div></div>;
+}
+
+function Chat({ id, user, name, locked, left }) {
   const [m, setM] = useState([]);
   const [t, setT] = useState('');
   const end = useRef(null);
@@ -136,6 +222,7 @@ function Chat({ id, user, name }) {
   }, [id]);
   useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [m]);
   async function send(e) { e.preventDefault(); const body = t.trim(); if (!body) return; setT(''); await sb.from('messages').insert({ workspace_id: id, user_id: user.id, name, body }); }
+  if (locked) return <div className="card lock"><div className="big">🔒</div><h3>Group chat is locked</h3><p className="mute">It opens when your reading time ends. {fmt(left)} left.</p></div>;
   return (
     <div className="card chat">
       <div className="msgs">
@@ -148,7 +235,7 @@ function Chat({ id, user, name }) {
   );
 }
 
-function Library({ id, user, docs, reload }) {
+function Library({ id, user, names, docs, reload, onOpen }) {
   const [course, setCourse] = useState('');
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -158,23 +245,22 @@ function Library({ id, user, docs, reload }) {
     if (!file) return;
     if (file.size > 15 * 1024 * 1024) return setErr('That file is over 15 MB. Split it or compress it first.');
     setBusy(true);
+    const cname = (course.trim() || 'General').slice(0, 40);
     const path = id + '/' + crypto.randomUUID() + '.pdf';
     const a = await sb.storage.from('slides').upload(path, file, { contentType: 'application/pdf' });
     if (a.error) { setErr(a.error.message); setBusy(false); return; }
-    const b = await sb.from('docs').insert({ workspace_id: id, title: file.name.replace(/\.pdf$/i, ''), course: course.trim() || 'General', path, created_by: user.id });
-    if (b.error) setErr(b.error.message); else { setFile(null); e.target.reset(); reload(); }
+    const b = await sb.from('docs').insert({ workspace_id: id, title: file.name.replace(/\.pdf$/i, ''), course: cname, path, created_by: user.id });
+    if (b.error) setErr(b.error.message); else { await sb.from('courses').insert({ workspace_id: id, name: cname }); setFile(null); e.target.reset(); reload(); }
     setBusy(false);
   }
-  const groups = docs.reduce((g, d) => ((g[d.course] = g[d.course] || []).push(d), g), {});
   return (
-    <div className="grid2">
-      <div>{Object.keys(groups).length === 0 ? <div className="card empty">No slides yet. Upload a PDF to start.</div> :
-        Object.entries(groups).map(([c, list]) => <div key={c} className="card" style={{ marginBottom: 14 }}><h3>{c}</h3>{list.map(d => <div key={d.id} className="doc"><span>{d.title}</span></div>)}</div>)}</div>
-      <form className="card" style={{ alignSelf: 'start' }} onSubmit={up}><h3>Add slides</h3>
-        <label htmlFor="c">Course</label><input id="c" value={course} onChange={e => setCourse(e.target.value)} placeholder="CSC 201" maxLength={40} />
+    <>
+      <form className="card" onSubmit={up}><h3>Add slides</h3>
+        <label htmlFor="c">Course module</label><input id="c" list="cs" value={course} onChange={e => setCourse(e.target.value)} placeholder="CSC 201" maxLength={40} /><datalist id="cs">{names.map(n => <option key={n} value={n} />)}</datalist>
         <label htmlFor="f">PDF file</label><input id="f" type="file" accept="application/pdf" onChange={e => setFile(e.target.files[0])} required />
         <p /><button className="btn" disabled={busy}>{busy ? 'Uploading…' : 'Upload'}</button>
         {err && <div className="err">{err}</div>}</form>
-    </div>
+      {names.map((c, i) => <div key={c} className="card"><h3>{c}</h3><div className="tiles">{docs.filter(d => d.course === c).map((d, j) => <button key={d.id} className={'tile t' + ((i + j) % 3)} onClick={() => onOpen(d)}><span>{d.title}</span><span>Read ›</span></button>)}</div></div>)}
+    </>
   );
 }
