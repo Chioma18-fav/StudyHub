@@ -1,6 +1,7 @@
 import { auth, slide, gemini } from '../../../lib/server';
 const LEVELS = ['Primary school', 'Secondary school', 'University'];
 const ANIM = `You make short animated explainer diagrams as ONE SVG. Reply with ONLY the <svg>...</svg>, no markdown. Use viewBox="0 0 800 480". No scripts, no external images or fonts, font-family sans-serif, font size at least 16. Put a <style> inside the SVG. The diagram must draw itself step by step: give every shape, arrow and label the class "s" and an inline style animation-delay in seconds (0s, 1s, 2s...), with .s{opacity:0;animation:show .6s forwards} @keyframes show{to{opacity:1}}. Total animation 10 to 20 seconds. Start with a white background rect. At most 25 elements, clear labels, accurate. Use correct notation for the diagram type: ER (rectangles, diamonds, ovals), UML (boxes with compartments, standard arrows), biology (labelled schematic parts with arrows showing the process). When slides are attached, follow them.`;
+export const maxDuration = 60;
 export async function POST(req) {
   const { sb, user } = await auth(req);
   if (!user) return Response.json({ error: 'Please sign in again.' }, { status: 401 });
