@@ -1,6 +1,7 @@
 import { auth, slide, gemini } from '../../../lib/server';
 const LEVELS = ['Primary school', 'Secondary school', 'University'];
-const ANIM = `You make short animated explainer diagrams as ONE SVG. Reply with ONLY the <svg>...</svg>, no markdown. Use viewBox="0 0 800 480". No scripts, no external images or fonts, font-family sans-serif, font size at least 16. Put a <style> inside the SVG. The diagram must draw itself step by step: give every shape, arrow and label the class "s" and an inline style animation-delay in seconds (0s, 1s, 2s...), with .s{opacity:0;animation:show .6s forwards} @keyframes show{to{opacity:1}}. Total animation 10 to 20 seconds. Start with a white background rect. At most 25 elements, clear labels, accurate. Use correct notation for the diagram type: ER (rectangles, diamonds, ovals), UML (boxes with compartments, standard arrows), biology (labelled schematic parts with arrows showing the process). When slides are attached, follow them.`;
+const STYLE = { 'Primary school': 'Style for a young child: bright cheerful colours (at least 4), big rounded shapes, very large text (24px or more), short simple words, at most 12 elements, friendly and playful with simple cartoon-like shapes.', 'Secondary school': 'Style for a teenager: clear and tidy, 3 to 4 colours used for colour-coding, labels 16 to 18px, a short title, at most 18 elements.', University: 'Style for a university student: precise standard notation, restrained professional palette, exact technical terms, concise labels 14 to 16px, up to 25 elements.' };
+const ANIM = `You make short animated explainer diagrams as ONE SVG. Reply with ONLY the <svg>...</svg>, no markdown. Use viewBox="0 0 800 480". No scripts, no external images or fonts, font-family sans-serif. Put a <style> inside the SVG. The diagram must draw itself step by step: give every shape, arrow and label the class "s" and an inline style animation-delay in seconds (0s, 1s, 2s...), with .s{opacity:0;animation:show .6s forwards} @keyframes show{to{opacity:1}}. Total animation 10 to 20 seconds. Start with a white background rect. Clear labels, accurate. Use correct notation for the diagram type: ER (rectangles, diamonds, ovals), UML (boxes with compartments, standard arrows), biology (labelled schematic parts with arrows showing the process). When slides are attached, follow them.`;
 export const maxDuration = 60;
 export async function POST(req) {
   const { sb, user } = await auth(req);
@@ -17,7 +18,7 @@ export async function POST(req) {
   const sp = await slide(sb, workspaceId, docId); if (sp) parts.unshift(sp);
   contents.push({ role: 'user', parts });
   const lvl = LEVELS.includes(level) ? level : 'University';
-  const sys = anim ? ANIM : `You are a patient study tutor for a ${lvl} student. Follow any style the student asks for (for example simpler words, examples, or step by step). When slides are attached, base answers on them and say if something is not in them. Be accurate and say when you are unsure.`;
+  const sys = anim ? ANIM + ' ' + STYLE[lvl] : `You are a patient study tutor for a ${lvl} student. Follow any style the student asks for (for example simpler words, examples, or step by step). When slides are attached, base answers on them and say if something is not in them. Be accurate and say when you are unsure.`;
   const r = await gemini(sys, contents);
   if (r.error) return Response.json({ error: r.error }, { status: 502 });
   if (anim) {
