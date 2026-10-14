@@ -21,9 +21,12 @@ function useFocus(id, user) {
   const [left, setLeft] = useState(0);
   const [strikes, setStrikes] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [brk, setBrk] = useState(0);
   const last = useRef(Date.now());
+  const brkEnd = useRef(0);
   const phaseRef = useRef('wait'), leftRef = useRef(0), strikesRef = useRef(0), sessRef = useRef(null);
   const go = p => { phaseRef.current = p; setPhase(p); };
+  const refresh = () => Promise.resolve(sb.from('sessions').select('*').eq('workspace_id', id).maybeSingle()).then(({ data }) => setSess(data));
   const save = () => sessRef.current ? Promise.resolve(sb.rpc('save_progress', { w: id, l: leftRef.current, k: strikesRef.current })) : Promise.resolve();
   useEffect(() => {
     const get = () => sb.from('sessions').select('*').eq('workspace_id', id).maybeSingle().then(({ data }) => setSess(data));
@@ -31,6 +34,19 @@ function useFocus(id, user) {
     const ch = sb.channel('sess-' + id).on('postgres_changes', { event: '*', schema: 'public', table: 'sessions', filter: 'workspace_id=eq.' + id }, get).subscribe();
     return () => { sb.removeChannel(ch); };
   }, [id]);
+  useEffect(() => {
+    const iv = setInterval(refresh, 15000);
+    window.addEventListener('focus', refresh);
+    return () => { clearInterval(iv); window.removeEventListener('focus', refresh); };
+  }, [id]);
+  useEffect(() => {
+    if (phase !== 'break') return;
+    const iv = setInterval(() => {
+      const r = Math.max(0, Math.round((brkEnd.current - Date.now()) / 1000)); setBrk(r);
+      if (r <= 0) { last.current = Date.now(); setLock(leftRef.current); go('run'); }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [phase]);
   useEffect(() => {
     sessRef.current = sess;
     if (!sess) { go('wait'); clearLock(); return; }
@@ -58,15 +74,28 @@ function useFocus(id, user) {
       setPaused(!active); if (!active) return;
       leftRef.current -= 1; setLeft(leftRef.current);
       if (leftRef.current <= 0) { leftRef.current = 0; save().then(() => sb.rpc('mark_done', { w: id })); clearLock(); go('done'); return; }
+      const S = sessRef.current, be = (S?.break_every || 0) * 60, bm = S?.break_minutes || 0, studied = (S?.minutes || 0) * 60 - leftRef.current;
+      if (be > 0 && bm > 0 && studied > 0 && studied % be === 0) { brkEnd.current = Date.now() + bm * 60000; setBrk(bm * 60); clearLock(); save().then(() => sb.rpc('start_break', { w: id })); go('break'); return; }
       if (++n % 5 === 0) { save(); setLock(leftRef.current); }
     }, 1000);
     return () => clearInterval(iv);
   }, [phase]);
-  return { sess, phase, left, strikes, paused, start: () => { last.current = Date.now(); setLock(leftRef.current); Promise.resolve(sb.rpc('begin_reading', { w: id })); go('run'); } };
+  return {
+    sess, phase, left, brk, strikes, paused, refresh,
+    resume: () => { last.current = Date.now(); setLock(leftRef.current); Promise.resolve(sb.rpc('end_break', { w: id })); go('run'); },
+    start: async () => {
+      const { data } = await sb.rpc('begin_reading', { w: id });
+      if (!data) return;
+      leftRef.current = data.left; setLeft(data.left);
+      setSess(x => x ? { ...x, minutes: data.minutes, break_every: data.be, break_minutes: data.bm } : x);
+      last.current = Date.now(); setLock(data.left); go('run');
+    },
+  };
 }
 
 function Room({ id, session, user, name }) {
   const f = useFocus(id, user);
+  const [level, setLevel] = useLevel();
   const [w, setW] = useState(null);
   const [people, setPeople] = useState([]);
   const [docs, setDocs] = useState([]);
@@ -78,7 +107,8 @@ function Room({ id, session, user, name }) {
   const [nc, setNc] = useState('');
   const [err, setErr] = useState('');
   const [copied, setCopied] = useState(false);
-  const [rv, setRv] = useState(30);
+  const [be, setBe] = useState(30);
+  const [bm, setBm] = useState(7);
   const loadPeople = async () => { const { data } = await sb.from('members').select('user_id,profiles(name)').eq('workspace_id', id); setPeople((data || []).map(x => ({ id: x.user_id, name: x.profiles?.name || 'Student' }))); };
   const reload = async () => {
     const a = await sb.from('docs').select('id,title,course,path').eq('workspace_id', id).order('created_at', { ascending: false }); setDocs(a.data || []);
@@ -94,7 +124,7 @@ function Room({ id, session, user, name }) {
   const running = f.phase === 'run';
   const qd = doc || docs.find(d => d.course === course) || docs[0];
   async function remove(p) { if (!confirm('Remove ' + p.name + ' from this workspace?')) return; await sb.from('members').delete().eq('workspace_id', id).eq('user_id', p.id); loadPeople(); }
-  async function begin() { setErr(''); const { error } = await sb.rpc('start_session', { w: id, m: Math.max(1, Math.min(600, +mins || 60)), rv: Math.max(5, Math.min(180, +rv || 30)) }); if (error) setErr(error.message); }
+  async function begin() { setErr(''); const { error } = await sb.rpc('start_session', { w: id, m: Math.max(1, Math.min(600, +mins || 60)), be: Math.max(0, Math.min(120, +be || 0)), bm: Math.max(0, Math.min(30, +bm || 0)) }); if (error) setErr(error.message); else f.refresh(); }
   async function addCourse(e) { e.preventDefault(); const n = nc.trim(); if (!n) return; await sb.from('courses').insert({ workspace_id: id, name: n.slice(0, 40) }); setNc(''); reload(); }
   const open = d => { setCourse(d.course); setDoc(d); setTab('study'); };
   const total = f.sess ? f.sess.minutes * 60 : 1;
@@ -102,7 +132,7 @@ function Room({ id, session, user, name }) {
     <>
       <div className="hdr"><div className="hdr-in">
         <div className="row between"><Link href="/dashboard" className="back" aria-label="Back" onClick={e => { if (f.phase === 'run') { e.preventDefault(); alert('Finish your reading time first.'); } }}>‹</Link>
-          <div className="timer">{running ? <><b>{fmt(f.left)}</b><span>{f.paused ? 'paused' : 'running'}</span></> : <span>{f.phase === 'done' ? 'Reading done' : 'No session running'}</span>}</div></div>
+          <div className="timer">{running ? <><b>{fmt(f.left)}</b><span>{f.paused ? 'paused' : 'running'}</span></> : f.phase === 'break' ? <><b>{fmt(f.brk)}</b><span>break</span></> : <span>{f.phase === 'done' ? 'Reading done' : 'No session running'}</span>}</div></div>
         <h1 className="wtitle">{w.name}</h1>
         <div className="pills">
           <button className="chip" onClick={() => { navigator.clipboard.writeText(w.code); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? 'Copied' : 'Code ' + w.code}</button>
@@ -117,13 +147,14 @@ function Room({ id, session, user, name }) {
         <section hidden={tab !== 'study'}>
           <div className="card"><h3>Study session</h3>
             {f.phase === 'wait' && <p className="mute">{isOwner ? 'Set the reading time for everyone in this workspace.' : 'Waiting for the workspace creator to set the reading time.'}</p>}
-            {f.phase === 'ready' && <><p className="mute">Reading time: {f.sess.minutes} min.{f.left < total ? ' You have ' + fmt(f.left) + ' left.' : ''}</p><button className="btn" style={{ width: '100%' }} onClick={f.start}>{f.left < total ? 'Resume reading' : 'Start reading'}</button></>}
+            {f.phase === 'ready' && <><p className="mute">Reading time: {f.sess.minutes} min.{f.sess.break_every > 0 && f.sess.break_minutes > 0 ? ' A ' + f.sess.break_minutes + '-minute break every ' + f.sess.break_every + ' minutes; chat opens during breaks.' : ''}{f.left < total ? ' You have ' + fmt(f.left) + ' left.' : ''}</p><button className="btn" style={{ width: '100%' }} onClick={f.start}>{f.left < total ? 'Resume reading' : 'Start reading'}</button></>}
             {running && <><div className="clock"><span>{fmt(f.left)}</span></div><div className="bar"><i style={{ width: ((total - f.left) / total * 100) + '%' }} /></div>
               {f.paused && <div className="pause" role="alert">Paused. Come back to this page and keep reading to continue.</div>}
               <p className="mute" style={{ margin: 0 }}>Times you left the page: {f.strikes}. Chat is locked until the timer ends.</p></>}
+            {f.phase === 'break' && <><div className="clock"><span>{fmt(f.brk)}</span></div><p className="mute">Break time. Chat is open now. Reading resumes by itself when the break ends.</p><button className="btn ghost" onClick={f.resume}>Resume now</button></>}
             {f.phase === 'done' && <><Confetti /><div className="ok" style={{ marginTop: 0 }}>Reading time complete. Chat is now unlocked. You left the page {f.strikes} {f.strikes === 1 ? 'time' : 'times'}.</div><p><button className="btn" style={{ marginTop: 12 }} onClick={() => setTab('review')}>Go to review</button></p></>}
             {isOwner && !running && <div style={{ marginTop: 14 }}><label htmlFor="m">{f.sess ? 'Start a new session for everyone (minutes)' : 'Reading time for everyone (minutes)'}</label>
-              <div className="row"><input id="m" type="number" min="1" max="600" value={mins} onChange={e => setMins(e.target.value)} /></div><label htmlFor="rv">Review time after reading (minutes)</label><div className="row"><input id="rv" type="number" min="5" max="180" value={rv} onChange={e => setRv(e.target.value)} /><button className="btn" onClick={begin}>Set</button></div></div>}
+              <div className="row"><input id="m" type="number" min="1" max="600" value={mins} onChange={e => setMins(e.target.value)} /></div><label htmlFor="be">Break every (minutes, 0 for no breaks)</label><div className="row"><input id="be" type="number" min="0" max="120" value={be} onChange={e => setBe(e.target.value)} /></div><label htmlFor="bm">Break length (minutes)</label><div className="row"><input id="bm" type="number" min="0" max="30" value={bm} onChange={e => setBm(e.target.value)} /><button className="btn" onClick={begin}>Set</button></div></div>}
             {err && <div className="err">{err}</div>}
           </div>
           
@@ -135,12 +166,12 @@ function Room({ id, session, user, name }) {
             {docs.filter(d => d.course === course).length === 0 && <p className="mute">No slides here yet. Add some in the Slides tab.</p>}
             <div className="tiles">{docs.filter(d => d.course === course).map((d, i) => <button key={d.id} className={'tile t' + (i % 3)} onClick={() => setDoc(d)}><span>{d.title}</span><span>›</span></button>)}</div></div>}
           {doc && <><div className="card"><div className="row between"><button className="chip" onClick={() => setDoc(null)}>‹ {doc.course}</button><span className="mute">{doc.title}</span></div><PdfView path={doc.path} /></div>
-            <Animate id={id} session={session} docId={doc.id} course={doc.course} /><Tutor id={id} session={session} user={user} course={doc.course} docId={doc.id} /></>}
+            <Animate id={id} session={session} docId={doc.id} course={doc.course} level={level} setLevel={setLevel} /><Tutor id={id} session={session} user={user} course={doc.course} docId={doc.id} level={level} setLevel={setLevel} /></>}
         </section>
 
         <section hidden={tab !== 'chat'}><Chat key={String(running)} id={id} user={user} name={name} locked={running} left={f.left} /></section>
         <section hidden={tab !== 'slides'}><Library id={id} user={user} names={names} docs={docs} reload={reload} onOpen={open} /></section>
-        <section hidden={tab !== 'history'}><History id={id} session={session} user={user} active={tab === 'history'} /></section>
+        <section hidden={tab !== 'history'}><History id={id} session={session} user={user} active={tab === 'history'} level={level} setLevel={setLevel} /></section>
         <section hidden={tab !== 'review'}><Review id={id} session={session} active={tab === 'review'} phase={f.phase} qd={qd} /></section>
       </main>
     </>
@@ -169,10 +200,9 @@ function PdfView({ path }) {
   return <div className="pdf">{st && <div className="empty">{st}</div>}<div ref={box} /></div>;
 }
 
-function Tutor({ id, session, user, course, docId }) {
+function Tutor({ id, session, user, course, docId, level, setLevel }) {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState('');
-  const [level, setLevel] = useState('University');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const end = useRef(null);
@@ -203,14 +233,14 @@ function Tutor({ id, session, user, course, docId }) {
   );
 }
 
-function History({ id, session, user, active }) {
+function History({ id, session, user, active, level, setLevel }) {
   const [items, setItems] = useState([]);
   const [open, setOpen] = useState(null);
   useEffect(() => {
     if (!active || open) return;
     sb.from('ai_chats').select('course,content').eq('workspace_id', id).eq('user_id', user.id).order('id', { ascending: false }).limit(200).then(({ data }) => { const m = {}; (data || []).forEach(x => { if (!m[x.course]) m[x.course] = x; }); setItems(Object.values(m)); });
   }, [id, active, open]);
-  if (open) return <div><button className="chip" style={{ marginBottom: 10 }} onClick={() => setOpen(null)}>‹ All chats</button><Tutor id={id} session={session} user={user} course={open} docId="" /></div>;
+  if (open) return <div><button className="chip" style={{ marginBottom: 10 }} onClick={() => setOpen(null)}>‹ All chats</button><Tutor id={id} session={session} user={user} course={open} docId="" level={level} setLevel={setLevel} /></div>;
   return <div className="card"><h3>AI chat history</h3>
     {items.length === 0 && <p className="mute">No AI chats yet. Open a slide and ask the tutor something.</p>}
     <div className="tiles">{items.map((x, i) => <button key={x.course} className={'tile t' + (i % 3)} onClick={() => setOpen(x.course)}><span>{x.course}<br /><small>{x.content.slice(0, 60)}</small></span><span>›</span></button>)}</div></div>;
@@ -313,25 +343,25 @@ function Review({ id, session, active, phase, qd }) {
   const [busy, setBusy] = useState(false);
   const check = () => Promise.resolve(sb.rpc('review_state', { w: id })).then(({ data }) => setSt(data || ''));
   useEffect(() => { if (active) check(); }, [active, phase]);
-  async function join() {
+  async function join(mode) {
     setErr(''); setBusy(true);
-    const r = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id }) });
+    const r = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id, mode }) });
     const j = await r.json(); setBusy(false);
     if (j.error) setErr(j.error); else setRoom(j);
   }
-  if (room) return <div className="card"><p className="mute">Review room · {room.minutes} minutes from when you joined.</p>
+  if (room) return <div className="card"><p className="mute">Review room · stay as long as you like.</p>
     <iframe title="Review room" src={room.url} allow="camera; microphone; fullscreen; display-capture; autoplay" style={{ width: '100%', height: '72vh', border: 0, borderRadius: 14 }} /></div>;
   if (st === 'quiz') return <Quiz id={id} session={session} doc={qd} onDone={check} />;
   return (
     <div className="card lock">
       {st === 'ready' ? <><div className="big">🎥</div><h3>Review room is open</h3><p className="mute">Talk through what you read with your study partners.</p>
-        <button className="btn" disabled={busy} onClick={join}>{busy ? 'Opening…' : 'Join review room'}</button>{err && <div className="err">{err}</div>}</>
+        <span className="row" style={{ justifyContent: 'center', flexWrap: 'wrap' }}><button className="btn" disabled={busy} onClick={() => join('video')}>{busy ? 'Opening…' : 'Join with video'}</button><button className="btn ghost" disabled={busy} onClick={() => join('voice')}>Join voice only</button></span>{err && <div className="err">{err}</div>}</>
         : <><div className="big">🔒</div><h3>Review room is locked</h3><p className="mute">{st === 'reading' ? 'Finish your reading time, then pass a short quiz to enter.' : st === 'wait' ? 'The workspace creator has not set a session yet.' : 'Checking…'}</p></>}
     </div>
   );
 }
 
-function Animate({ id, session, docId, course }) {
+function Animate({ id, session, docId, course, level, setLevel }) {
   const [t, setT] = useState('');
   const [svg, setSvg] = useState('');
   const [busy, setBusy] = useState(false);
@@ -340,7 +370,7 @@ function Animate({ id, session, docId, course }) {
   async function go(e) {
     e.preventDefault(); if (!t.trim() || busy) return; setBusy(true); setErr(''); setSvg('');
     try {
-      const r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id, docId, course, anim: true, message: 'Animate step by step: ' + t.trim() }) });
+      const r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ workspaceId: id, docId, course, anim: true, level, message: 'Animate step by step: ' + t.trim() }) });
       const j = await r.json(); if (j.error) setErr(j.error); else { setSvg(j.svg); setK(x => x + 1); }
     } catch { setErr('No connection. Check your data and try again.'); }
     setBusy(false);
@@ -348,9 +378,16 @@ function Animate({ id, session, docId, course }) {
   return (
     <div className="card"><h3>Animate a diagram</h3>
       <p className="mute" style={{ fontSize: 14 }}>Describe it, for example "ER diagram for a hospital" or "how mitosis works". The AI draws it step by step using this slide for context. Check the result against your notes.</p>
+      <div className="row" style={{ marginBottom: 8 }}><span className="mute" style={{ fontSize: 14 }}>Style for</span><select aria-label="Level" value={level} onChange={e => setLevel(e.target.value)}><option>Primary school</option><option>Secondary school</option><option>University</option></select></div>
       <form className="row" onSubmit={go}><input aria-label="What to animate" value={t} onChange={e => setT(e.target.value)} placeholder="What should I draw?" maxLength={300} /><button className="btn" disabled={busy}>{busy ? 'Drawing…' : 'Animate'}</button></form>
       {err && <div className="err">{err}</div>}
       {svg && <><iframe key={k} title="Animated diagram" sandbox="" srcDoc={'<!doctype html><style>body{margin:0;background:#fff}svg{width:100%;height:auto;display:block}</style>' + svg} style={{ width: '100%', height: 380, border: '1px solid #e1e8e2', borderRadius: 14, marginTop: 12, background: '#fff' }} /><p><button className="chip" onClick={() => setK(x => x + 1)}>Replay</button></p></>}
     </div>
   );
+}
+
+function useLevel() {
+  const [l, setL] = useState('University');
+  useEffect(() => { try { const v = localStorage.getItem('sh:level'); if (v) setL(v); } catch {} }, []);
+  return [l, v => { setL(v); try { localStorage.setItem('sh:level', v); } catch {} }];
 }
